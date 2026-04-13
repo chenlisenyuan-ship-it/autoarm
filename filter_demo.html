@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>一阶低通滤波 (EMA) 算法可视化模拟器</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f4f7f6;
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .container {
+            width: 90%;
+            max-width: 1200px;
+            background: white;
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 8px 20px rgba(0,0,0,0.1);
+        }
+        h1 {
+            text-align: center;
+            color: #333;
+            margin-bottom: 30px;
+        }
+        .control-panel {
+            display: flex;
+            justify-content: space-between;
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 30px;
+            border: 1px solid #e9ecef;
+        }
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            width: 30%;
+        }
+        .control-group label {
+            font-weight: bold;
+            margin-bottom: 10px;
+            color: #495057;
+        }
+        .control-group input[type="range"] {
+            width: 100%;
+        }
+        .control-group select {
+            padding: 8px;
+            border-radius: 4px;
+            border: 1px solid #ced4da;
+            font-size: 14px;
+        }
+        .value-display {
+            color: #007bff;
+            font-weight: bold;
+        }
+        .chart-container {
+            position: relative;
+            height: 50vh;
+            width: 100%;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>🎛️ 视觉夹爪控制：一阶低通滤波 (EMA) 实时模拟</h1>
+
+    <div class="control-panel">
+        <div class="control-group">
+            <label>Alpha (信任度系数): <span id="alpha-val" class="value-display">0.40</span></label>
+            <input type="range" id="alpha" min="0.01" max="1.00" step="0.01" value="0.40">
+            <small style="color: #6c757d; margin-top: 5px;">值越小越平滑，但延迟越大</small>
+        </div>
+
+        <div class="control-group">
+            <label>摄像头噪点强度: <span id="noise-val" class="value-display">80</span></label>
+            <input type="range" id="noise" min="0" max="200" step="10" value="80">
+            <small style="color: #6c757d; margin-top: 5px;">模拟画面抖动误差</small>
+        </div>
+
+        <div class="control-group">
+            <label>模拟手势动作:</label>
+            <select id="signal-type">
+                <option value="step">突然握拳/张开 (阶跃信号)</option>
+                <option value="sine">缓慢匀速张合 (正弦波信号)</option>
+            </select>
+        </div>
+    </div>
+
+    <div class="chart-container">
+        <canvas id="filterChart"></canvas>
+    </div>
+</div>
+
+<script>
+    // ---------------- UI 交互逻辑 ----------------
+    console.log('Filter demo script loading...');
+    const alphaSlider = document.getElementById('alpha');
+    const alphaVal = document.getElementById('alpha-val');
+    const noiseSlider = document.getElementById('noise');
+    const noiseVal = document.getElementById('noise-val');
+    const signalType = document.getElementById('signal-type');
+
+    alphaSlider.addEventListener('input', (e) => alphaVal.innerText = parseFloat(e.target.value).toFixed(2));
+    noiseSlider.addEventListener('input', (e) => noiseVal.innerText = e.target.value);
+
+    // ---------------- 图表初始化 ----------------
+    if (typeof Chart === 'undefined') {
+        console.error('Chart.js failed to load!');
+        alert('Chart.js库加载失败，请检查网络连接或使用本地HTTP服务器打开此页面。');
+    }
+    const ctx = document.getElementById('filterChart').getContext('2d');
+    const maxDataPoints = 100; // 屏幕上显示的最多数据点
+
+    // 初始化空数据数组
+    const labels = Array(maxDataPoints).fill('');
+    const idealData = Array(maxDataPoints).fill(null);
+    const targetData = Array(maxDataPoints).fill(null);
+    const smoothedData = Array(maxDataPoints).fill(null);
+
+    const chart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: labels,
+            datasets: [
+                {
+                    label: '真实意图 (Ideal)',
+                    borderColor: 'rgba(0, 0, 0, 0.3)',
+                    borderDash: [5, 5], // 虚线
+                    data: idealData,
+                    fill: false,
+                    pointRadius: 0,
+                    borderWidth: 2
+                },
+                {
+                    label: '摄像头原始值带噪点 (Target PWM)',
+                    borderColor: 'rgba(255, 99, 132, 0.6)',
+                    data: targetData,
+                    fill: false,
+                    pointRadius: 0,
+                    borderWidth: 1.5
+                },
+                {
+                    label: '滤波后输出给舵机 (Smoothed PWM)',
+                    borderColor: 'rgba(40, 167, 69, 1)', // 粗绿线
+                    data: smoothedData,
+                    fill: false,
+                    pointRadius: 0,
+                    borderWidth: 3
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: false, // 关闭自带动画以实现丝滑滚动
+            scales: {
+                y: {
+                    min: 400,
+                    max: 1700,
+                    title: { display: true, text: 'PWM 脉冲值 (600-1500)' }
+                },
+                x: {
+                    display: false // 隐藏 X 轴标签
+                }
+            },
+            plugins: {
+                legend: { position: 'bottom' }
+            }
+        }
+    });
+
+    // ---------------- 核心算法与循环 ----------------
+    let timeTick = 0;
+    let lastSmoothed = 600; // 初始状态假设张开 (PWM=600)
+
+    function updateChart() {
+        console.log('updateChart called', timeTick);
+        const alpha = parseFloat(alphaSlider.value);
+        const noise = parseFloat(noiseSlider.value);
+        const type = signalType.value;
+
+        // 1. 生成真实意图 (Ideal)
+        let currentIdeal = 600;
+        if (type === 'step') {
+            // 阶跃：每 60 个 tick 切换一次张开/闭合状态
+            currentIdeal = (timeTick % 120 < 60) ? 600 : 1500;
+        } else {
+            // 正弦：在 600 到 1500 之间平滑震荡，中心点是 1050，振幅 450
+            currentIdeal = 1050 + 450 * Math.sin(timeTick * 0.05);
+        }
+
+        // 2. 生成模拟摄像头读取值 (Target = Ideal + 随机噪点)
+        const currentNoise = (Math.random() * 2 - 1) * noise; // 生成 -noise 到 +noise 的随机数
+        const currentTarget = currentIdeal + currentNoise;
+
+        // 3. 🧠 核心滤波算法 (代码中对应的那一行)
+        if (timeTick === 0) lastSmoothed = currentTarget; // 第一帧初始化
+        const currentSmoothed = alpha * currentTarget + (1 - alpha) * lastSmoothed;
+
+        // 更新历史记录
+        lastSmoothed = currentSmoothed;
+
+        // 4. 将数据推入数组并剔除老数据（实现向左滚动效果）
+        idealData.push(currentIdeal);
+        idealData.shift();
+
+        targetData.push(currentTarget);
+        targetData.shift();
+
+        smoothedData.push(currentSmoothed);
+        smoothedData.shift();
+
+        // 5. 刷新图表
+        chart.update();
+        timeTick++;
+    }
+
+    // 设置定时器，每 50 毫秒刷新一帧，模拟你的 cv2.VideoCapture 帧率
+    console.log('Setting interval timer');
+    setInterval(updateChart, 50);
+</script>
+
+</body>
+</html>
